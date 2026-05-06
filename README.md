@@ -97,6 +97,8 @@ AOT method LCM.PlatformEnsureManifestInitialized va=0x101767d10 runtime=0x... by
 
 这用于全能签注入后的 native hook 验证：先确认地址和入口字节稳定，再考虑 inline hook `DoesAssetExist` / `LoadImpl` / `PlatformEnsureManifestInitialized`。
 
+当前诊断版默认不启用 AOT inline hook，因为部分 iOS 环境会拒绝修改主程序代码页。插件会继续记录 AOT 地址，并额外追踪 `manifest`、`hash`、`json`、`xml`、`resources`、`bundle`、`dat`、`bin` 等可疑内容索引文件访问，用于定位 manifest 的真实来源。
+
 ## 新增 XNB 推荐方式
 
 在 AOT 环境里，新增资源名可能过不了游戏的 manifest 检查。更稳定的做法是：地图里引用一个游戏原本就存在的资源名，然后用 `_aliases.txt` 把这个已登记资源名映射到真实新增 XNB。
@@ -138,6 +140,7 @@ Documents/CustomContent/Maps/panorama.xnb
 4. 放置真实文件 `Documents/CustomContent/Maps/panorama.xnb`。
 5. 触发地图加载后，日志应出现 `alias redirect`。
 6. 如果仍然在 `Could not load ... asset` 前没有任何 `open/stat/access redirect`，说明失败发生在 manifest 检查阶段，需要进一步 hook `DoesAssetExist` 或 `LoadImpl`。
+7. 如果日志出现 `manifest/hash/json/xml/resources trace` 相关路径，把这些路径对应文件导出来分析，下一步可以做离线 manifest patch。
 
 ## 编译
 

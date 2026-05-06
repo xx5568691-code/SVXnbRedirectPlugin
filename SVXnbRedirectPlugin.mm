@@ -188,6 +188,31 @@ static NSString *SVAssetNameFromContentPath(NSString *path) {
     return SVNormalizeAssetName(relative);
 }
 
+static BOOL SVShouldTraceContentPath(NSString *path) {
+    if (path.length == 0) return NO;
+    NSString *lower = [[path stringByReplacingOccurrencesOfString:@"\\" withString:@"/"] lowercaseString];
+    NSArray<NSString *> *needles = @[
+        @"manifest", @"contenthash", @"content_hash", @"hash", @"asset", @"resource",
+        @".json", @".xml", @".dat", @".bin", @".resources", @".bundle", @".plist"
+    ];
+    for (NSString *needle in needles) {
+        if ([lower containsString:needle]) return YES;
+    }
+    return NO;
+}
+
+static void SVTraceFileProbe(const char *apiName, NSString *original) {
+    if (!SVShouldTraceContentPath(original)) return;
+    BOOL isDir = NO;
+    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:original isDirectory:&isDir];
+    unsigned long long size = 0;
+    if (exists && !isDir) {
+        NSDictionary<NSFileAttributeKey, id> *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:original error:nil];
+        size = [attrs[NSFileSize] unsignedLongLongValue];
+    }
+    SVLog(@"%@ trace: exists=%@ dir=%@ size=%llu path=%@", [NSString stringWithUTF8String:apiName], exists ? @"yes" : @"no", isDir ? @"yes" : @"no", size, original);
+}
+
 static void SVEnsureCustomContentFolders(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray<NSString *> *folders = @[
@@ -586,6 +611,7 @@ static const char *SVRedirectPath(const char *path, char *buffer, size_t bufferS
     @autoreleasepool {
         SVReloadAliasMapIfNeeded();
         NSString *original = [NSString stringWithUTF8String:path];
+        SVTraceFileProbe(apiName, original);
         NSString *custom = SVCustomPathForOriginal(original);
         if (custom.length == 0) return path;
         if (!SVFileExists(custom)) {
@@ -702,7 +728,7 @@ __attribute__((constructor)) static void SVXnbRedirectMain(void) {
         SVWriteReadmeToDocuments();
         SVLogImportantFiles();
         SVLogAotMethodAddresses();
-        SVInstallAotHooks();
+        SVLog(@"AOT inline hooks disabled: code pages are protected on this iOS environment; using manifest tracing and file redirects only");
         SVScheduleManifestPatches();
 
         struct rebinding binds[] = {

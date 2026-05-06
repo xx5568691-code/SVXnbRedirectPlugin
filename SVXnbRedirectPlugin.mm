@@ -16,8 +16,10 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +35,32 @@ static FILE *(*orig_fopen)(const char *path, const char *mode) = NULL;
 static int (*orig_access)(const char *path, int mode) = NULL;
 static int (*orig_stat)(const char *path, struct stat *buf) = NULL;
 static int (*orig_lstat)(const char *path, struct stat *buf) = NULL;
+
+static NSDictionary<NSString *, NSString *> *gAliasMap = nil;
+static NSDate *gAliasMapModifiedAt = nil;
+
+struct SVAotMethodAddress {
+    const char *name;
+    uintptr_t va;
+};
+
+static const uintptr_t SVAotVmBase = 0x100000000ULL;
+static const struct SVAotMethodAddress SVAotMethods[] = {
+    {"MonoGame.TitleContainer.OpenStream", 0x1003c12d0ULL},
+    {"MonoGame.TitleContainer.PlatformOpenStream", 0x102382e84ULL},
+    {"MonoGame.ContentManager.OpenStream", 0x1003c4760ULL},
+    {"MonoGame.ContentManager.ReadAsset", 0x1003c4930ULL},
+    {"ContentHashParser.ParseFromFile", 0x1016fcde8ULL},
+    {"LCM.PlatformEnsureManifestInitialized", 0x101767d10ULL},
+    {"LCM.EnsureManifestInitialized", 0x101779594ULL},
+    {"LCM.DoesAssetExist", 0x10177a7b4ULL},
+    {"LCM.LoadImpl", 0x10177a974ULL},
+    {"LCM.Load", 0x10177aac8ULL},
+    {"LCM.Load(language)", 0x10177abb8ULL},
+    {"xTile.Map.LoadTileSheets", 0x1024a7000ULL},
+    {"xTile.TileSheet.get_ImageSource", 0x1024aa86cULL},
+    {"xTile.XnaDisplayDevice.LoadTileSheet", 0x1024b6b64ULL},
+};
 
 typedef void MonoDomain;
 typedef void MonoAssembly;
@@ -97,6 +125,136 @@ static BOOL SVFileExists(NSString *path) {
 
 static NSString *SVCustomContentRoot(void) {
     return [[SVDocumentsPath() stringByAppendingPathComponent:@"CustomContent"] stringByStandardizingPath];
+}
+
+static NSDate *SVFileModifiedAt(NSString *path);
+
+static NSString *SVNormalizeAssetName(NSString *asset) {
+    if (asset.length == 0) return @"";
+    NSString *normalized = [asset stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+    while ([normalized hasPrefix:@"/"]) normalized = [normalized substringFromIndex:1];
+    if ([[normalized lowercaseString] hasPrefix:@"content/"]) normalized = [normalized substringFromIndex:@"Content/".length];
+    if ([[normalized lowercaseString] hasSuffix:@".xnb"]) normalized = [normalized substringToIndex:normalized.length - 4];
+    return normalized;
+}
+
+static NSString *SVAssetNameFromContentPath(NSString *path) {
+    if (path.length == 0) return nil;
+    NSString *normalized = [path stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+    NSRange contentRange = [normalized rangeOfString:@"/Content/" options:NSCaseInsensitiveSearch];
+    if (contentRange.location == NSNotFound) return nil;
+    NSString *relative = [normalized substringFromIndex:contentRange.location + @"/Content/".length];
+    if (![[relative lowercaseString] hasSuffix:@".xnb"]) return nil;
+    return SVNormalizeAssetName(relative);
+}
+
+static void SVEnsureCustomContentFolders(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *folders = @[
+        SVCustomContentRoot(),
+        [SVCustomContentRoot() stringByAppendingPathComponent:@"Maps"],
+        [SVCustomContentRoot() stringByAppendingPathComponent:@"Buildings"],
+        [SVCustomContentRoot() stringByAppendingPathComponent:@"Data"],
+        [SVCustomContentRoot() stringByAppendingPathComponent:@"TileSheets"],
+        [SVCustomContentRoot() stringByAppendingPathComponent:@"LooseSprites"],
+        [SVCustomContentRoot() stringByAppendingPathComponent:@"Characters"],
+        [SVCustomContentRoot() stringByAppendingPathComponent:@"Animals"],
+        [SVCustomContentRoot() stringByAppendingPathComponent:@"Fonts"],
+        [SVCustomContentRoot() stringByAppendingPathComponent:@"Strings"],
+    ];
+
+    for (NSString *folder in folders) {
+        NSError *error = nil;
+        if (![fm createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:&error]) {
+            SVLog(@"create CustomContent folder failed: %@ error=%@", folder, error.localizedDescription ?: @"unknown");
+        }
+    }
+}
+
+static void SVLoadAliasMap(void) {
+    NSString *path = [SVCustomContentRoot() stringByAppendingPathComponent:@"_aliases.txt"];
+    gAliasMapModifiedAt = SVFileModifiedAt(path);
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (text.length == 0) {
+        gAliasMap = @{};
+        SVLog(@"alias map skipped: missing %@", path);
+        return;
+    }
+
+    NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
+    NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    for (NSString *rawLine in lines) {
+        NSString *line = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (line.length == 0 || [line hasPrefix:@"#"] || [line hasPrefix:@"//"]) continue;
+
+        NSRange sep = [line rangeOfString:@"="];
+        if (sep.location == NSNotFound) sep = [line rangeOfString:@"->"];
+        if (sep.location == NSNotFound) continue;
+
+        NSString *left = [[line substringToIndex:sep.location] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *right = [[line substringFromIndex:sep.location + sep.length] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *alias = SVNormalizeAssetName(left);
+        NSString *target = SVNormalizeAssetName(right);
+        if (alias.length > 0 && target.length > 0) map[alias.lowercaseString] = target;
+    }
+
+    gAliasMap = [map copy];
+    SVLog(@"alias map loaded: %lu entries from %@", (unsigned long)gAliasMap.count, path);
+}
+
+static NSString *SVAliasTargetForAsset(NSString *assetName) {
+    if (assetName.length == 0 || !gAliasMap) return nil;
+    return gAliasMap[SVNormalizeAssetName(assetName).lowercaseString];
+}
+
+static NSDate *SVFileModifiedAt(NSString *path) {
+    if (path.length == 0) return nil;
+    NSDictionary<NSFileAttributeKey, id> *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    return attrs[NSFileModificationDate];
+}
+
+static void SVReloadAliasMapIfNeeded(void) {
+    NSString *path = [SVCustomContentRoot() stringByAppendingPathComponent:@"_aliases.txt"];
+    NSDate *modifiedAt = SVFileModifiedAt(path);
+    BOOL changed = NO;
+    if (!modifiedAt && gAliasMapModifiedAt) changed = YES;
+    if (modifiedAt && !gAliasMapModifiedAt) changed = YES;
+    if (modifiedAt && gAliasMapModifiedAt && [modifiedAt compare:gAliasMapModifiedAt] != NSOrderedSame) changed = YES;
+    if (!changed) return;
+    SVLoadAliasMap();
+}
+
+static void SVLogAotMethodAddresses(void) {
+    const char *mainExecutable = [[[NSBundle mainBundle] executablePath] fileSystemRepresentation];
+    intptr_t slide = 0;
+    bool found = false;
+
+    uint32_t imageCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imageCount; i++) {
+        const char *imageName = _dyld_get_image_name(i);
+        if (!imageName || !mainExecutable) continue;
+        if (strcmp(imageName, mainExecutable) == 0 || strstr(imageName, "/StardewValley") != NULL) {
+            slide = _dyld_get_image_vmaddr_slide(i);
+            found = true;
+            SVLog(@"AOT image[%u] name=%s slide=0x%llx", i, imageName, (unsigned long long)slide);
+            break;
+        }
+    }
+
+    if (!found) {
+        SVLog(@"AOT image not found for executable=%s", mainExecutable ?: "(null)");
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(SVAotMethods) / sizeof(SVAotMethods[0]); i++) {
+        uintptr_t runtimeAddress = SVAotMethods[i].va + (uintptr_t)slide;
+        const uint8_t *bytes = (const uint8_t *)runtimeAddress;
+        SVLog(@"AOT method %@ va=0x%llx runtime=0x%llx bytes=%02x %02x %02x %02x %02x %02x %02x %02x",
+              [NSString stringWithUTF8String:SVAotMethods[i].name],
+              (unsigned long long)SVAotMethods[i].va,
+              (unsigned long long)runtimeAddress,
+              bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
+    }
 }
 
 static void SVLogFileProbe(NSString *label, NSString *path) {
@@ -236,7 +394,7 @@ static void SVPatchContentManifestNow(NSString *reason) {
             return;
         }
         if (!SVLoadMonoApi()) {
-            SVLog(@"manifest patch skipped (%@): mono api unavailable", reason);
+            SVLog(@"manifest patch skipped (%@): mono api unavailable; .NET iOS AOT builds cannot use mono_* runtime patching, so newly added assets must also exist in app Content or be registered by another offline patch", reason);
             return;
         }
 
@@ -298,15 +456,11 @@ static void SVScheduleManifestPatches(void) {
 
 static NSString *SVCustomPathForOriginal(NSString *original) {
     if (original.length == 0) return nil;
-    NSString *normalized = [original stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
-    NSRange contentRange = [normalized rangeOfString:@"/Content/" options:NSCaseInsensitiveSearch];
-    if (contentRange.location == NSNotFound) return nil;
+    NSString *assetName = SVAssetNameFromContentPath(original);
+    if (assetName.length == 0) return nil;
 
-    NSString *relative = [normalized substringFromIndex:contentRange.location + @"/Content/".length];
-    if (relative.length == 0) return nil;
-
-    // Only redirect XNB content. This avoids touching saves, dylibs, plists, etc.
-    if (![[relative lowercaseString] hasSuffix:@".xnb"]) return nil;
+    NSString *targetAsset = SVAliasTargetForAsset(assetName) ?: assetName;
+    NSString *relative = [targetAsset stringByAppendingString:@".xnb"];
 
     NSString *customRoot = SVCustomContentRoot();
     NSString *custom = [[customRoot stringByAppendingPathComponent:relative] stringByStandardizingPath];
@@ -316,6 +470,7 @@ static NSString *SVCustomPathForOriginal(NSString *original) {
 static const char *SVRedirectPath(const char *path, char *buffer, size_t bufferSize, const char *apiName) {
     if (!path || bufferSize == 0) return path;
     @autoreleasepool {
+        SVReloadAliasMapIfNeeded();
         NSString *original = [NSString stringWithUTF8String:path];
         NSString *custom = SVCustomPathForOriginal(original);
         if (custom.length == 0) return path;
@@ -327,13 +482,19 @@ static const char *SVRedirectPath(const char *path, char *buffer, size_t bufferS
             }
             return path;
         }
+        NSString *assetName = SVAssetNameFromContentPath(original);
+        NSString *aliasTarget = SVAliasTargetForAsset(assetName);
         const char *utf8 = [custom fileSystemRepresentation];
         if (strlen(utf8) + 1 > bufferSize) {
             SVLog(@"%@ redirect path too long: %@", [NSString stringWithUTF8String:apiName], custom);
             return path;
         }
         strcpy(buffer, utf8);
-        SVLog(@"%@ redirect: %@ -> %@", [NSString stringWithUTF8String:apiName], original, custom);
+        if (aliasTarget.length > 0) {
+            SVLog(@"%@ alias redirect: %@ (%@ -> %@) -> %@", [NSString stringWithUTF8String:apiName], original, assetName, aliasTarget, custom);
+        } else {
+            SVLog(@"%@ redirect: %@ -> %@", [NSString stringWithUTF8String:apiName], original, custom);
+        }
         return buffer;
     }
 }
@@ -396,16 +557,22 @@ static void SVWriteReadmeToDocuments(void) {
     "星露谷 iOS XNB 重定向插件\n"
     "==========================\n\n"
     "把新增或覆盖的 XNB 放到 Documents/CustomContent 下，目录结构要对应 Content。\n\n"
+    "AOT 版本不能稳定运行时修改 manifest。新增资源推荐用别名方式：地图里引用一个游戏原本存在的资源名，然后在 _aliases.txt 把这个资源名指向真实新增 XNB。\n\n"
     "示例：\n"
     "游戏请求 Content/Maps/wind_valley_tiles.xnb\n"
     "你应放置 Documents/CustomContent/Maps/wind_valley_tiles.xnb\n\n"
     "游戏请求 Content/Buildings/Wind Valley Barn.xnb\n"
     "你应放置 Documents/CustomContent/Buildings/Wind Valley Barn.xnb\n\n"
+    "别名示例：\n"
+    "地图里引用 Content/Maps/springobjects.xnb\n"
+    "_aliases.txt 写 Maps/springobjects=Maps/panorama\n"
+    "真实文件放 Documents/CustomContent/Maps/panorama.xnb\n\n"
     "注意：\n"
     "1. 地图内部引用通常不要带 .xnb 或 .png。\n"
     "2. 路径大小写要完全一致。\n"
     "3. 使用 /，不要使用反斜杠。\n"
-    "4. 日志文件：Documents/sv_xnb_redirect.log\n";
+    "4. 本插件可稳定替换已有 XNB。新增 XNB 在 .NET iOS AOT 版本里还需要资源已存在于 app Content，或使用离线 manifest 补丁登记。\n"
+    "5. 日志文件：Documents/sv_xnb_redirect.log\n";
     if (!SVFileExists(path)) {
         [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
@@ -416,8 +583,11 @@ __attribute__((constructor)) static void SVXnbRedirectMain(void) {
         SVLog(@"SVXnbRedirectPlugin loaded");
         SVLog(@"bundle=%@", [[NSBundle mainBundle] bundlePath]);
         SVLog(@"documents=%@", SVDocumentsPath());
+        SVEnsureCustomContentFolders();
+        SVLoadAliasMap();
         SVWriteReadmeToDocuments();
         SVLogImportantFiles();
+        SVLogAotMethodAddresses();
         SVScheduleManifestPatches();
 
         struct rebinding binds[] = {

@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <libkern/OSCacheControl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -318,7 +319,7 @@ static BOOL SVWriteCode(void *address, const void *bytes, size_t length) {
         return NO;
     }
     memcpy(address, bytes, length);
-    __builtin___clear_cache((char *)address, (char *)address + length);
+    sys_icache_invalidate(address, length);
     kr = vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) SVLog(@"vm_protect rx restore failed address=%p kr=%d", address, kr);
     return YES;
@@ -336,7 +337,7 @@ static BOOL SVInstallBranchHook(void *target, void *replacement, void **original
     memcpy(stub, target, 16);
     uint32_t back = SVArm64BranchInstruction((uintptr_t)stub + 16, (uintptr_t)target + 16, 0x14000000u);
     memcpy(stub + 16, &back, sizeof(back));
-    __builtin___clear_cache((char *)stub, (char *)stub + stubSize);
+    sys_icache_invalidate(stub, stubSize);
     *originalOut = stub;
 
     uint32_t patch[4];

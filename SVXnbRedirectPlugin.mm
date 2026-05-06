@@ -99,8 +99,26 @@ static NSString *SVCustomContentRoot(void) {
     return [[SVDocumentsPath() stringByAppendingPathComponent:@"CustomContent"] stringByStandardizingPath];
 }
 
+static void SVLogFileProbe(NSString *label, NSString *path) {
+    BOOL isDir = NO;
+    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir];
+    unsigned long long size = 0;
+    if (exists && !isDir) {
+        NSDictionary<NSFileAttributeKey, id> *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        size = [attrs fileSize];
+    }
+    SVLog(@"probe %@ exists=%@ dir=%@ size=%llu path=%@", label, exists ? @"yes" : @"no", isDir ? @"yes" : @"no", size, path);
+}
+
 static NSString *SVBundleContentRoot(void) {
     return [[[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"Content"] stringByStandardizingPath];
+}
+
+static void SVLogImportantFiles(void) {
+    SVLogFileProbe(@"bundle Maps/panorama.xnb", [SVBundleContentRoot() stringByAppendingPathComponent:@"Maps/panorama.xnb"]);
+    SVLogFileProbe(@"custom Maps/panorama.xnb", [SVCustomContentRoot() stringByAppendingPathComponent:@"Maps/panorama.xnb"]);
+    SVLogFileProbe(@"bundle Maps/Farm.xnb", [SVBundleContentRoot() stringByAppendingPathComponent:@"Maps/Farm.xnb"]);
+    SVLogFileProbe(@"custom Maps/Farm.xnb", [SVCustomContentRoot() stringByAppendingPathComponent:@"Maps/Farm.xnb"]);
 }
 
 static void *SVDlsymAny(const char *primary, const char *fallback) {
@@ -135,6 +153,13 @@ static BOOL SVLoadMonoApi(void) {
               mono_field_static_get_value_fn && mono_object_get_class_fn && mono_class_get_method_from_name_fn &&
               mono_string_new_fn && mono_runtime_invoke_fn && (mono_domain_get_fn || mono_get_root_domain_fn));
     SVLog(@"mono api loaded=%@", loaded ? @"yes" : @"no");
+    if (!loaded) {
+        SVLog(@"mono api detail: domain_get=%p root_domain=%p thread_attach=%p assembly_foreach=%p assembly_get_image=%p image_get_name=%p class_from_name=%p field_from_name=%p class_vtable=%p field_static_get=%p object_get_class=%p method_from_name=%p string_new=%p runtime_invoke=%p",
+              mono_domain_get_fn, mono_get_root_domain_fn, mono_thread_attach_fn, mono_assembly_foreach_fn,
+              mono_assembly_get_image_fn, mono_image_get_name_fn, mono_class_from_name_fn,
+              mono_class_get_field_from_name_fn, mono_class_vtable_fn, mono_field_static_get_value_fn,
+              mono_object_get_class_fn, mono_class_get_method_from_name_fn, mono_string_new_fn, mono_runtime_invoke_fn);
+    }
     return loaded;
 }
 
@@ -296,7 +321,8 @@ static const char *SVRedirectPath(const char *path, char *buffer, size_t bufferS
         if (custom.length == 0) return path;
         if (!SVFileExists(custom)) {
             // Log misses only when the request targets a custom-looking resource, to keep logs readable.
-            if ([[original lowercaseString] containsString:@"custom"] || [[original lowercaseString] containsString:@"wind"] || [[original lowercaseString] containsString:@"valley"]) {
+            NSString *lowerOriginal = [original lowercaseString];
+            if ([lowerOriginal containsString:@"custom"] || [lowerOriginal containsString:@"wind"] || [lowerOriginal containsString:@"valley"] || [lowerOriginal containsString:@"panorama"] || [lowerOriginal containsString:@"manifest"] || [lowerOriginal containsString:@"hash"]) {
                 SVLog(@"%@ miss: %@ -> %@", [NSString stringWithUTF8String:apiName], original, custom);
             }
             return path;
@@ -391,6 +417,7 @@ __attribute__((constructor)) static void SVXnbRedirectMain(void) {
         SVLog(@"bundle=%@", [[NSBundle mainBundle] bundlePath]);
         SVLog(@"documents=%@", SVDocumentsPath());
         SVWriteReadmeToDocuments();
+        SVLogImportantFiles();
         SVScheduleManifestPatches();
 
         struct rebinding binds[] = {

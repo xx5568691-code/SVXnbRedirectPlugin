@@ -1,0 +1,21 @@
+这个包用于在没有 Mac 的情况下编译 iOS 注入插件。
+
+原因：
+Windows 不能合法安装 Apple iPhoneOS SDK，缺少 SDK 时无法直接编译 arm64 iOS dylib。
+
+使用方式：
+1. 新建一个 GitHub 仓库。
+2. 把本包里的所有文件上传到仓库根目录。
+3. 打开 GitHub 仓库的 Actions 页面。
+4. 运行 build-ios-dylib 工作流。
+5. 等编译完成后，在 Artifacts 下载 SVFishingPlugin-dylib。
+6. 解压得到 SVFishingPlugin.dylib。
+7. 用全能签导入这个 dylib 插件后重签游戏。
+
+插件运行后会在游戏 Documents 目录写入：
+sv_fishing_plugin.log
+sv_fishing_hints.txt
+
+注意：
+这个插件目前是“注入验证 + native offset 补丁框架”。
+iOS 版星露谷是 .NET iOS AOT，真正跳过钓鱼需要后续定位 BobberBar/FishingRod 的 native 偏移，然后写入 sv_fishing_patch.txt。

@@ -1,0 +1,36 @@
+星露谷 iOS 插件总包
+
+包含内容：
+
+1. SVXnbRedirectPlugin
+新增 XNB 重定向插件源码。
+作用：把游戏访问 StardewValley.app/Content/.../*.xnb 的请求，优先重定向到 Documents/CustomContent/.../*.xnb。
+用途：解决 iOS 1.6.15 新增 XNB 加载不到的问题。
+
+2. SVFishingPlugin
+钓鱼插件源码框架。
+作用：验证 dylib 注入、写日志、支持 native offset 补丁配置。
+注意：它不是最终自动钓鱼成品，iOS 是 .NET AOT，需要先定位 BobberBar/FishingRod 的 native 偏移。
+
+3. SVFishingPluginCloudBuild
+钓鱼插件的 GitHub Actions 云编译示例包。
+
+Windows 不能直接编译 iOS dylib 的原因：
+iOS dylib 需要 Apple iPhoneOS.sdk、Foundation/UIKit framework、Mach-O linker，这些只能通过 Xcode/macOS 正常获得。
+
+推荐编译方式：
+把对应插件目录上传到 GitHub 仓库根目录，运行 Actions 里的 build-ios-dylib，下载 Artifact 得到 dylib。
+
+建议优先测试：
+先测试 SVXnbRedirectPlugin，因为它不依赖游戏内部 native offset，成功率更高。
+
+XNB 插件使用目录示例：
+游戏请求：Content/Maps/wind_valley_tiles.xnb
+你放置：Documents/CustomContent/Maps/wind_valley_tiles.xnb
+
+游戏请求：Content/Buildings/Wind Valley Barn.xnb
+你放置：Documents/CustomContent/Buildings/Wind Valley Barn.xnb
+
+日志文件：
+SVXnbRedirectPlugin：Documents/sv_xnb_redirect.log
+SVFishingPlugin：Documents/sv_fishing_plugin.log

@@ -17,12 +17,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -35,6 +37,7 @@ static FILE *(*orig_fopen)(const char *path, const char *mode) = NULL;
 static int (*orig_access)(const char *path, int mode) = NULL;
 static int (*orig_stat)(const char *path, struct stat *buf) = NULL;
 static int (*orig_lstat)(const char *path, struct stat *buf) = NULL;
+static bool (*orig_doesAssetExist)(void *self, void *assetName) = NULL;
 
 static NSDictionary<NSString *, NSString *> *gAliasMap = nil;
 static NSDate *gAliasMapModifiedAt = nil;
@@ -61,6 +64,9 @@ static const struct SVAotMethodAddress SVAotMethods[] = {
     {"xTile.TileSheet.get_ImageSource", 0x1024aa86cULL},
     {"xTile.XnaDisplayDevice.LoadTileSheet", 0x1024b6b64ULL},
 };
+
+static uintptr_t gAotSlide = 0;
+static bool gAotSlideReady = false;
 
 typedef void MonoDomain;
 typedef void MonoAssembly;
@@ -128,6 +134,8 @@ static NSString *SVCustomContentRoot(void) {
 }
 
 static NSDate *SVFileModifiedAt(NSString *path);
+static NSString *SVAliasTargetForAsset(NSString *assetName);
+static NSString *SVBundleContentRoot(void);
 
 static NSString *SVNormalizeAssetName(NSString *asset) {
     if (asset.length == 0) return @"";
@@ -136,6 +144,37 @@ static NSString *SVNormalizeAssetName(NSString *asset) {
     if ([[normalized lowercaseString] hasPrefix:@"content/"]) normalized = [normalized substringFromIndex:@"Content/".length];
     if ([[normalized lowercaseString] hasSuffix:@".xnb"]) normalized = [normalized substringToIndex:normalized.length - 4];
     return normalized;
+}
+
+static NSString *SVNSStringFromManagedString(void *managedString) {
+    if (!managedString) return nil;
+    @try {
+        // System.String object layout on 64-bit Mono/.NET AOT: object header, int length, UTF-16 chars.
+        int32_t length = *(int32_t *)((uint8_t *)managedString + 0x10);
+        if (length <= 0 || length > 4096) return nil;
+        const unichar *chars = (const unichar *)((uint8_t *)managedString + 0x14);
+        return [NSString stringWithCharacters:chars length:(NSUInteger)length];
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static BOOL SVAssetExistsOnDisk(NSString *assetName) {
+    NSString *asset = SVNormalizeAssetName(assetName);
+    if (asset.length == 0) return NO;
+
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    NSString *aliasTarget = SVAliasTargetForAsset(asset);
+    if (aliasTarget.length > 0) [candidates addObject:aliasTarget];
+    [candidates addObject:asset];
+
+    for (NSString *candidate in candidates) {
+        NSString *relative = [candidate stringByAppendingString:@".xnb"];
+        NSString *custom = [[SVCustomContentRoot() stringByAppendingPathComponent:relative] stringByStandardizingPath];
+        NSString *bundle = [[SVBundleContentRoot() stringByAppendingPathComponent:relative] stringByStandardizingPath];
+        if (SVFileExists(custom) || SVFileExists(bundle)) return YES;
+    }
+    return NO;
 }
 
 static NSString *SVAssetNameFromContentPath(NSString *path) {
@@ -235,6 +274,8 @@ static void SVLogAotMethodAddresses(void) {
         if (!imageName || !mainExecutable) continue;
         if (strcmp(imageName, mainExecutable) == 0 || strstr(imageName, "/StardewValley") != NULL) {
             slide = _dyld_get_image_vmaddr_slide(i);
+            gAotSlide = (uintptr_t)slide;
+            gAotSlideReady = true;
             found = true;
             SVLog(@"AOT image[%u] name=%s slide=0x%llx", i, imageName, (unsigned long long)slide);
             break;
@@ -255,6 +296,78 @@ static void SVLogAotMethodAddresses(void) {
               (unsigned long long)runtimeAddress,
               bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
     }
+}
+
+static void *SVAotRuntimeAddress(uintptr_t va) {
+    if (!gAotSlideReady) return NULL;
+    return (void *)(va + gAotSlide);
+}
+
+static uint32_t SVArm64BranchInstruction(uintptr_t from, uintptr_t to, uint32_t opcode) {
+    int64_t delta = (int64_t)to - (int64_t)from;
+    int64_t imm26 = delta >> 2;
+    return opcode | ((uint32_t)imm26 & 0x03ffffffu);
+}
+
+static BOOL SVWriteCode(void *address, const void *bytes, size_t length) {
+    if (!address || !bytes || length == 0) return NO;
+    vm_address_t page = (vm_address_t)address & ~(vm_page_size - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        SVLog(@"vm_protect rwx failed address=%p kr=%d", address, kr);
+        return NO;
+    }
+    memcpy(address, bytes, length);
+    __builtin___clear_cache((char *)address, (char *)address + length);
+    kr = vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) SVLog(@"vm_protect rx restore failed address=%p kr=%d", address, kr);
+    return YES;
+}
+
+static BOOL SVInstallBranchHook(void *target, void *replacement, void **originalOut, const char *name) {
+    if (!target || !replacement || !originalOut) return NO;
+    size_t stubSize = 20;
+    uint8_t *stub = (uint8_t *)mmap(NULL, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (stub == MAP_FAILED) {
+        SVLog(@"AOT hook %@ failed: mmap", [NSString stringWithUTF8String:name]);
+        return NO;
+    }
+
+    memcpy(stub, target, 16);
+    uint32_t back = SVArm64BranchInstruction((uintptr_t)stub + 16, (uintptr_t)target + 16, 0x14000000u);
+    memcpy(stub + 16, &back, sizeof(back));
+    __builtin___clear_cache((char *)stub, (char *)stub + stubSize);
+    *originalOut = stub;
+
+    uint32_t patch[4];
+    patch[0] = 0x58000050u; // ldr x16, #8
+    patch[1] = 0xd61f0200u; // br x16
+    memcpy(&patch[2], &replacement, sizeof(replacement));
+
+    if (!SVWriteCode(target, patch, sizeof(patch))) return NO;
+    SVLog(@"AOT hook installed %@ target=%p replacement=%p trampoline=%p", [NSString stringWithUTF8String:name], target, replacement, stub);
+    return YES;
+}
+
+static bool hook_DoesAssetExist(void *self, void *assetNameObject) {
+    @autoreleasepool {
+        SVReloadAliasMapIfNeeded();
+        NSString *assetName = SVNSStringFromManagedString(assetNameObject);
+        if (assetName.length > 0 && SVAssetExistsOnDisk(assetName)) {
+            SVLog(@"DoesAssetExist allow: %@", assetName);
+            return true;
+        }
+    }
+    return orig_doesAssetExist ? orig_doesAssetExist(self, assetNameObject) : false;
+}
+
+static void SVInstallAotHooks(void) {
+    void *doesAssetExist = SVAotRuntimeAddress(0x10177a7b4ULL);
+    if (!doesAssetExist) {
+        SVLog(@"AOT hook skipped: slide unavailable");
+        return;
+    }
+    SVInstallBranchHook(doesAssetExist, (void *)hook_DoesAssetExist, (void **)&orig_doesAssetExist, "LCM.DoesAssetExist");
 }
 
 static void SVLogFileProbe(NSString *label, NSString *path) {
@@ -588,6 +701,7 @@ __attribute__((constructor)) static void SVXnbRedirectMain(void) {
         SVWriteReadmeToDocuments();
         SVLogImportantFiles();
         SVLogAotMethodAddresses();
+        SVInstallAotHooks();
         SVScheduleManifestPatches();
 
         struct rebinding binds[] = {

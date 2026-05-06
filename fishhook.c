@@ -4,12 +4,14 @@
 #include "fishhook.h"
 
 #include <dlfcn.h>
+#include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -55,6 +57,9 @@ static int prepend_rebindings(struct rebindings_entry **rebindings_head, struct 
 static void perform_rebinding_with_section(struct rebindings_entry *rebindings, section_t *section, intptr_t slide, nlist_t *symtab, char *strtab, uint32_t *indirect_symtab) {
   uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
   void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
+  size_t section_size = section->size;
+  vm_address_t page_start = (vm_address_t)((uintptr_t)indirect_symbol_bindings & ~(uintptr_t)(getpagesize() - 1));
+  vm_size_t page_size = (vm_size_t)(((uintptr_t)indirect_symbol_bindings + section_size) - page_start);
 
   for (uint32_t i = 0; i < section->size / sizeof(void *); i++) {
     uint32_t symtab_index = indirect_symbol_indices[i];
@@ -68,6 +73,7 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings, 
     while (cur) {
       for (uint32_t j = 0; j < cur->rebindings_nel; j++) {
         if (strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
+          vm_protect(mach_task_self(), page_start, page_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
           if (cur->rebindings[j].replaced && indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
             *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
           }

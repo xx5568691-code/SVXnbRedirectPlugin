@@ -105,3 +105,4 @@ xcrun --sdk iphoneos clang++ -arch arm64 -dynamiclib \
 3. 不要使用反斜杠 `\`。
 4. 插件会多次重试补 manifest，因为游戏的 `_manifest` 可能在插件加载后才初始化。
 5. 如果游戏先通过 `File.Exists/stat/access` 判断文件是否存在，本插件也会重定向这些检查。
+6. 如果日志停在 `documents=...` 且没有 `fishhook rebind result=...`，说明旧版 fishhook 在当前 iOS 上写只读符号表时崩溃，请使用包含 `vm_protect` 修复的新版源码重新编译。

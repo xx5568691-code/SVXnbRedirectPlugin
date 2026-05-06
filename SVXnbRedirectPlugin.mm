@@ -99,6 +99,10 @@ static NSString *SVCustomContentRoot(void) {
     return [[SVDocumentsPath() stringByAppendingPathComponent:@"CustomContent"] stringByStandardizingPath];
 }
 
+static NSString *SVBundleContentRoot(void) {
+    return [[[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"Content"] stringByStandardizingPath];
+}
+
 static void *SVDlsymAny(const char *primary, const char *fallback) {
     void *symbol = dlsym(RTLD_DEFAULT, primary);
     if (!symbol && fallback) symbol = dlsym(RTLD_DEFAULT, fallback);
@@ -146,21 +150,37 @@ static void SVFindStardewAssembly(MonoAssembly *assembly, void *userData) {
     }
 }
 
-static NSArray<NSString *> *SVCustomAssetNames(void) {
-    NSString *root = SVCustomContentRoot();
+static void SVCollectAssetNamesFromRoot(NSString *root, NSMutableSet<NSString *> *assets, NSString *label) {
+    if (root.length == 0 || !assets) return;
     NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:root isDirectory:&isDir] || !isDir) {
+        SVLog(@"manifest scan %@ skipped: missing %@", label, root);
+        return;
+    }
+
     NSDirectoryEnumerator<NSString *> *enumerator = [fm enumeratorAtPath:root];
-    NSMutableArray<NSString *> *assets = [NSMutableArray array];
+    int count = 0;
     for (NSString *relative in enumerator) {
-        BOOL isDir = NO;
         NSString *full = [root stringByAppendingPathComponent:relative];
-        if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+        BOOL itemIsDir = NO;
+        if (![fm fileExistsAtPath:full isDirectory:&itemIsDir] || itemIsDir) continue;
         if (![[relative lowercaseString] hasSuffix:@".xnb"]) continue;
 
         NSString *asset = [[relative substringToIndex:relative.length - 4] stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
-        if (asset.length > 0) [assets addObject:asset];
+        if (asset.length > 0) {
+            [assets addObject:asset];
+            count++;
+        }
     }
-    return assets;
+    SVLog(@"manifest scan %@ found %d xnb under %@", label, count, root);
+}
+
+static NSArray<NSString *> *SVCustomAssetNames(void) {
+    NSMutableSet<NSString *> *assets = [NSMutableSet set];
+    SVCollectAssetNamesFromRoot(SVBundleContentRoot(), assets, @"bundle Content");
+    SVCollectAssetNamesFromRoot(SVCustomContentRoot(), assets, @"Documents CustomContent");
+    return assets.allObjects;
 }
 
 static BOOL SVHashSetAddString(MonoDomain *domain, MonoObject *hashSet, NSString *assetName) {
@@ -187,7 +207,7 @@ static void SVPatchContentManifestNow(NSString *reason) {
     @autoreleasepool {
         NSArray<NSString *> *assets = SVCustomAssetNames();
         if (assets.count == 0) {
-            SVLog(@"manifest patch skipped (%@): no CustomContent xnb", reason);
+            SVLog(@"manifest patch skipped (%@): no xnb found in bundle Content or Documents CustomContent", reason);
             return;
         }
         if (!SVLoadMonoApi()) {
